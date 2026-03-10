@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  AGENT_RUNTIME,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -25,7 +26,7 @@ import {
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
-import { detectAuthMode } from './credential-proxy.js';
+import { detectAuthMode, readCursorApiKey } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -163,6 +164,44 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // For Cursor runtime: write .cursor/mcp.json so the nanoclaw MCP server
+  // is available to the Cursor Agent CLI inside the container.
+  if (AGENT_RUNTIME === 'cursor') {
+    const cursorConfigDir = path.join(
+      DATA_DIR,
+      'sessions',
+      group.folder,
+      '.cursor',
+    );
+    fs.mkdirSync(cursorConfigDir, { recursive: true });
+    const cursorMcpConfig = path.join(cursorConfigDir, 'mcp.json');
+    fs.writeFileSync(
+      cursorMcpConfig,
+      JSON.stringify(
+        {
+          mcpServers: {
+            nanoclaw: {
+              command: 'node',
+              args: ['/tmp/dist/ipc-mcp-stdio.js'],
+              env: {
+                NANOCLAW_CHAT_JID: '__PLACEHOLDER_JID__',
+                NANOCLAW_GROUP_FOLDER: group.folder,
+                NANOCLAW_IS_MAIN: group.isMain ? '1' : '0',
+              },
+            },
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+    mounts.push({
+      hostPath: cursorConfigDir,
+      containerPath: '/workspace/group/.cursor',
+      readonly: false,
+    });
+  }
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
@@ -221,21 +260,34 @@ function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Route API traffic through the credential proxy (containers never see real secrets)
-  args.push(
-    '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
-  );
+  // Tell the container which agent runtime to use
+  args.push('-e', `AGENT_RUNTIME=${AGENT_RUNTIME}`);
 
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  if (AGENT_RUNTIME === 'cursor') {
+    // Cursor Agent CLI handles its own API calls directly — no credential proxy.
+    // Pass the real API key since Cursor doesn't support proxied auth.
+    const cursorKey = readCursorApiKey();
+    if (cursorKey) {
+      args.push('-e', `CURSOR_API_KEY=${cursorKey}`);
+    }
   } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    // Claude mode: route API traffic through the credential proxy
+    // (containers never see real secrets)
+    args.push(
+      '-e',
+      `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+    );
+
+    // Mirror the host's auth method with a placeholder value.
+    // API key mode: SDK sends x-api-key, proxy replaces with real key.
+    // OAuth mode:   SDK exchanges placeholder token for temp API key,
+    //               proxy injects real OAuth token on that exchange request.
+    const authMode = detectAuthMode();
+    if (authMode === 'api-key') {
+      args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+    } else {
+      args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    }
   }
 
   // Runtime-specific args for host gateway resolution

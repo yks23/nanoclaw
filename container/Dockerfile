@@ -33,6 +33,10 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Install agent-browser and claude-code globally
 RUN npm install -g agent-browser @anthropic-ai/claude-code
 
+# Install Cursor Agent CLI (used when AGENT_RUNTIME=cursor)
+RUN HOME=/home/node curl https://cursor.com/install -fsSL | HOME=/home/node bash || true
+ENV PATH="/home/node/.local/bin:${PATH}"
+
 # Create app directory
 WORKDIR /app
 

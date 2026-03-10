@@ -16,8 +16,13 @@
 
 import fs from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+
+type AgentRuntime = 'claude' | 'cursor';
+const AGENT_RUNTIME: AgentRuntime =
+  (process.env.AGENT_RUNTIME as AgentRuntime) || 'claude';
 
 interface ContainerInput {
   prompt: string;
@@ -324,12 +329,182 @@ function waitForIpcMessage(): Promise<string | null> {
 }
 
 /**
- * Run a single query and stream results via writeOutput.
+ * Run a single query — dispatches to Claude or Cursor runtime.
+ */
+async function runQuery(
+  prompt: string,
+  sessionId: string | undefined,
+  mcpServerPath: string,
+  containerInput: ContainerInput,
+  sdkEnv: Record<string, string | undefined>,
+  resumeAt?: string,
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+  if (AGENT_RUNTIME === 'cursor') {
+    return runCursorQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv);
+  }
+  return runClaudeQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+}
+
+/**
+ * Run a query using Cursor Agent CLI via stream-json output.
+ */
+async function runCursorQuery(
+  prompt: string,
+  sessionId: string | undefined,
+  mcpServerPath: string,
+  containerInput: ContainerInput,
+  _sdkEnv: Record<string, string | undefined>,
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+  let closedDuringQuery = false;
+  let newSessionId: string | undefined;
+  let resultCount = 0;
+
+  // Write .cursor/mcp.json for this run with the correct chatJid
+  const cursorDir = '/workspace/group/.cursor';
+  fs.mkdirSync(cursorDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(cursorDir, 'mcp.json'),
+    JSON.stringify({
+      mcpServers: {
+        nanoclaw: {
+          command: 'node',
+          args: [mcpServerPath],
+          env: {
+            NANOCLAW_CHAT_JID: containerInput.chatJid,
+            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+          },
+        },
+      },
+    }, null, 2) + '\n',
+  );
+
+  const args = [
+    '-p',                        // non-interactive / print mode
+    '--force',                   // auto-approve file writes and shell commands
+    '--output-format', 'stream-json',
+    '--approve-mcps',            // auto-approve MCP servers
+    '--workspace', '/workspace/group',
+  ];
+
+  if (sessionId) {
+    args.push('--resume', sessionId);
+  }
+
+  args.push(prompt);
+
+  log(`Spawning cursor agent with args: ${args.join(' ').slice(0, 200)}...`);
+
+  // Poll IPC for follow-up messages and _close sentinel
+  let ipcPolling = true;
+  const pendingMessages: string[] = [];
+  const pollIpc = () => {
+    if (!ipcPolling) return;
+    if (shouldClose()) {
+      log('Close sentinel detected during cursor query');
+      closedDuringQuery = true;
+      ipcPolling = false;
+      return;
+    }
+    const messages = drainIpcInput();
+    for (const text of messages) {
+      log(`IPC message received during cursor query (${text.length} chars) — queued for next turn`);
+      pendingMessages.push(text);
+    }
+    setTimeout(pollIpc, IPC_POLL_MS);
+  };
+  setTimeout(pollIpc, IPC_POLL_MS);
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('agent', args, {
+      cwd: '/workspace/group',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env },
+    });
+
+    let lastResultText = '';
+    let lineBuffer = '';
+
+    child.stdout.on('data', (data: Buffer) => {
+      lineBuffer += data.toString();
+      const lines = lineBuffer.split('\n');
+      lineBuffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+
+          if (event.type === 'system' && event.session_id) {
+            newSessionId = event.session_id;
+            log(`Cursor session: ${newSessionId}`);
+          }
+
+          if (event.type === 'assistant' && event.message?.content) {
+            const textParts = Array.isArray(event.message.content)
+              ? event.message.content
+                  .filter((c: { type: string }) => c.type === 'text')
+                  .map((c: { text: string }) => c.text)
+              : [String(event.message.content)];
+            const text = textParts.join('');
+            if (text) lastResultText = text;
+          }
+
+          if (event.type === 'result') {
+            resultCount++;
+            const resultText = event.result || lastResultText || null;
+            log(`Cursor result #${resultCount}: ${(resultText || '').slice(0, 200)}`);
+            writeOutput({
+              status: 'success',
+              result: resultText,
+              newSessionId,
+            });
+            lastResultText = '';
+          }
+        } catch {
+          // Non-JSON line from cursor agent stderr leaking to stdout
+        }
+      }
+    });
+
+    child.stderr.on('data', (data: Buffer) => {
+      const text = data.toString().trim();
+      if (text) log(`[cursor-stderr] ${text.slice(0, 500)}`);
+    });
+
+    child.on('close', (code) => {
+      ipcPolling = false;
+
+      if (code !== 0 && resultCount === 0) {
+        log(`Cursor agent exited with code ${code}`);
+        writeOutput({
+          status: 'error',
+          result: null,
+          error: `Cursor agent exited with code ${code}`,
+        });
+      }
+
+      log(`Cursor query done. Results: ${resultCount}, closedDuringQuery: ${closedDuringQuery}`);
+      resolve({ newSessionId, lastAssistantUuid: undefined, closedDuringQuery });
+    });
+
+    child.on('error', (err) => {
+      ipcPolling = false;
+      log(`Cursor agent spawn error: ${err.message}`);
+      reject(err);
+    });
+
+    child.stdin.end();
+  });
+}
+
+/**
+ * Run a single query using Claude Agent SDK.
  * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
  * allowing agent teams subagents to run to completion.
  * Also pipes IPC messages into the stream during the query.
  */
-async function runQuery(
+async function runClaudeQuery(
   prompt: string,
   sessionId: string | undefined,
   mcpServerPath: string,

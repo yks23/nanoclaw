@@ -123,3 +123,9 @@ export function detectAuthMode(): AuthMode {
   const secrets = readEnvFile(['ANTHROPIC_API_KEY']);
   return secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
 }
+
+/** Read the Cursor API key from .env (if configured). */
+export function readCursorApiKey(): string | undefined {
+  const secrets = readEnvFile(['CURSOR_API_KEY']);
+  return secrets.CURSOR_API_KEY || undefined;
+}
