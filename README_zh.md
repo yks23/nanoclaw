@@ -52,7 +52,7 @@ claude
 
 ## 功能支持
 
-- **多渠道消息** - 通过 WhatsApp、Telegram、Discord、Slack 或 Gmail 与您的助手对话。使用 `/add-whatsapp` 或 `/add-telegram` 等技能添加渠道，可同时运行一个或多个。
+- **多渠道消息** - 通过 WhatsApp、Telegram、Discord、Slack、Gmail、飞书、微信或企业微信与您的助手对话。使用 `/add-whatsapp`、`/add-telegram`、`/add-feishu`、`/add-wechat` 或 `/add-wecom` 等技能添加渠道，可同时运行一个或多个。
 - **隔离的群组上下文** - 每个群组都拥有独立的 `CLAUDE.md` 记忆和隔离的文件系统。它们在各自的容器沙箱中运行，且仅挂载所需的文件系统。
 - **主频道** - 您的私有频道（self-chat），用于管理控制；其他所有群组都完全隔离
 - **计划任务** - 运行 Claude 的周期性作业，并可以给您回发消息
